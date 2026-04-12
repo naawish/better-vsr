@@ -40,7 +40,6 @@ class ProcessingWorker(QThread):
         cap = None
         try:
             # 1. INITIALIZE AI ENGINE
-            # This loads the ONNX model into memory
             self.log.emit("Initializing AI Engine (LaMa)...")
             ai = AIProcessor(self.s['model_path'])
 
@@ -56,25 +55,26 @@ class ProcessingWorker(QThread):
                 return
 
             # 3. CALCULATE SAFE DIMENSIONS
-            # Ensures even numbers for maximum codec compatibility
+            # Ensures even numbers for maximum codec compatibility (NVIDIA/AMD)
             safe_w = width if width % 2 == 0 else width - 1
             safe_h = height if height % 2 == 0 else height - 1
 
             # 4. START ENCODER (FFMPEG)
-            # We use DEVNULL for stderr to prevent the "0.02% stall" caused by 
-            # the OS pipe buffer filling up with technical text.
             v_codec = FFmpegEngine.get_codec(self.s['accel'], self.s['v_codec'])
             cmd = FFmpegEngine.build_command(
                 self.s['ffmpeg_path'], self.s['in_path'], self.s['out_path'],
                 width, height, fps, v_codec, self.s['a_codec']
             )
             
+            # --- CRITICAL FIX: CREATE_NO_WINDOW ---
+            # This flag prevents the blank black terminal from popping up on Windows
             self.process = subprocess.Popen(
                 cmd, 
                 stdin=subprocess.PIPE, 
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL, # Prevents Pipe Deadlock
-                bufsize=10**7 
+                stderr=subprocess.DEVNULL, 
+                bufsize=10**7,
+                creationflags=subprocess.CREATE_NO_WINDOW 
             )
 
             self.log.emit(f"Processing started using {v_codec}...")
@@ -83,7 +83,6 @@ class ProcessingWorker(QThread):
             count = 0
             while cap.isOpened() and self.is_running:
                 # --- Handle Pause ---
-                # Checks is_running inside the loop so "Stop" works during pause
                 while self._paused and self.is_running:
                     time.sleep(0.1)
                 
@@ -95,12 +94,11 @@ class ProcessingWorker(QThread):
                 if not ret: 
                     break
 
-                # --- Ensure Correct Resolution ---
+                # --- Ensure Correct Resolution for Pipe ---
                 if frame.shape[1] != safe_w or frame.shape[0] != safe_h:
                     frame = cv2.resize(frame, (safe_w, safe_h))
 
                 # --- AI Subtitle Removal ---
-                # This calls our optimized processor with RGB correction
                 frame = ai.process_frame(frame, self.s['roi'])
                 
                 # --- Send to Encoder Pipe ---
@@ -112,7 +110,7 @@ class ProcessingWorker(QThread):
 
                 # --- Update Progress ---
                 count += 1
-                # Emit every frame for smooth 0.01% updates
+                # Update every frame for smooth 99.99% visual feedback
                 pct = (count / total_frames) * 100
                 self.progress.emit(pct)
 

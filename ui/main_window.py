@@ -1,33 +1,54 @@
 # ui/main_window.py
 import os
 import cv2
+import sys
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QFrame, QLabel, QProgressBar, QTextEdit, 
                              QFileDialog, QComboBox, QGraphicsDropShadowEffect)
 from PyQt6.QtCore import Qt, pyqtSlot
 from PyQt6.QtGui import QImage, QPixmap, QDragEnterEvent, QDropEvent, QColor
 
+# For Windows Drag-and-Drop Fix
+if sys.platform == "win32":
+    import ctypes
+
+# Modular imports for the App's "Brain", "Engine", and Custom Widgets
 from ui.theme import STYLESHEET
 from ui.widgets import GlassCard, ModernSlider, MetadataTag, GlassButton
 from core.ffmpeg_engine import FFmpegEngine
 from core.worker import ProcessingWorker
+from core.paths import get_resource_path  # CRITICAL for Nuitka EXE support
 
 class BetterVSRWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         
+        # --- 1. WINDOW SECURITY BYPASS (For Drag-and-Drop in EXE) ---
+        if sys.platform == "win32":
+            # This allows the app to receive drop messages even when running as a high-integrity process
+            # 0x233 = WM_DROPFILES, 0x0049 = WM_COPYDATA, 0x0047 = WM_COPYGLOBALDATA
+            ctypes.windll.user32.ChangeWindowMessageFilter(0x233, 1)
+            ctypes.windll.user32.ChangeWindowMessageFilter(0x0049, 1)
+            ctypes.windll.user32.ChangeWindowMessageFilter(0x0047, 1)
+
+        # --- 2. WINDOW SETTINGS ---
         self.setWindowTitle("BetterVSR Pro")
         self.resize(1200, 960)
         
+        # Internal State
         self.video_path = None
         self.cap = None
         self.current_frame = None 
         self.worker_thread = None
 
+        # Glassmorphism & Frameless Configuration
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
+        
+        # CRITICAL: Allow drops on the main window
         self.setAcceptDrops(True)
 
+        # Main Layout Container
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
         self.layout = QVBoxLayout(self.central_widget)
@@ -35,24 +56,31 @@ class BetterVSRWindow(QMainWindow):
         # INCREASED MARGINS: Necessary to prevent the Drop Shadow from being clipped
         self.layout.setContentsMargins(20, 20, 20, 20) 
         
+        # The Glass Frame (Targeted by QSS)
         self.main_frame = QFrame()
         self.main_frame.setObjectName("MainFrame")
+        
+        # CRITICAL: Also allow drops on the interactive frame
+        self.main_frame.setAcceptDrops(True)
+        
         self.ui_layout = QVBoxLayout(self.main_frame)
         self.ui_layout.setContentsMargins(30, 30, 30, 30)
         self.layout.addWidget(self.main_frame)
         
         # --- APPLY WINDOW DROP SHADOW ---
         shadow = QGraphicsDropShadowEffect(self)
-        shadow.setBlurRadius(30)               # Diffuse shadow
-        shadow.setXOffset(0)                   # Perfectly centered shadow
-        shadow.setYOffset(8)                   # Pushed down for light height simulation
-        shadow.setColor(QColor(0, 0, 0, 180))  # Semi-transparent dark shadow
+        shadow.setBlurRadius(30)               
+        shadow.setXOffset(0)                   
+        shadow.setYOffset(8)                   
+        shadow.setColor(QColor(0, 0, 0, 180))  
         self.main_frame.setGraphicsEffect(shadow)
 
         self.setup_ui()
         self.setStyleSheet(STYLESHEET)
 
     def setup_ui(self):
+        """Initializes the UI components using professional custom widgets."""
+        
         # --- HEADER ---
         header = QHBoxLayout()
         title = QLabel("BETTERVSR PRO")
@@ -78,18 +106,20 @@ class BetterVSRWindow(QMainWindow):
             color: #666;
             font-weight: bold;
         """)
+        # We handle drops at the window level, but the preview is the visual target
         self.ui_layout.addWidget(self.preview, alignment=Qt.AlignmentFlag.AlignCenter)
 
+        # Timeline scrubbing slider
         self.scrub_slider = ModernSlider(Qt.Orientation.Horizontal)
         self.scrub_slider.setEnabled(False)
         self.scrub_slider.valueChanged.connect(self.seek_video)
         self.ui_layout.addWidget(self.scrub_slider)
 
-        # --- DASHBOARD SECTION (3 Opaque Glass Cards) ---
+        # --- DASHBOARD SECTION (3 Glass Cards) ---
         dash_layout = QHBoxLayout()
         dash_layout.setSpacing(20)
 
-        # 1: ROI Selection
+        # pillar 1: ROI Selection
         self.roi_card = GlassCard("Subtitle Area (%)")
         self.roi_card.setFixedWidth(320)
         roi_inner = QHBoxLayout()
@@ -100,7 +130,7 @@ class BetterVSRWindow(QMainWindow):
         self.roi_card.layout.addLayout(roi_inner)
         dash_layout.addWidget(self.roi_card)
 
-        # 2: Encoding Engine
+        # Pillar 2: Encoding Engine
         self.enc_card = GlassCard("Encoding Engine")
         enc_layout = QVBoxLayout()
         enc_layout.setSpacing(10)
@@ -108,7 +138,7 @@ class BetterVSRWindow(QMainWindow):
         enc_layout.addWidget(QLabel("Hardware Acceleration"))
         self.combo_accel = QComboBox()
         self.combo_accel.addItems(["CPU (Software)", "NVIDIA (NVENC)", "AMD (AMF)"])
-        self.combo_accel.setCurrentIndex(1)
+        self.combo_accel.setCurrentIndex(0) 
         enc_layout.addWidget(self.combo_accel)
 
         enc_layout.addWidget(QLabel("Video Codec"))
@@ -124,7 +154,7 @@ class BetterVSRWindow(QMainWindow):
         self.enc_card.layout.addLayout(enc_layout)
         dash_layout.addWidget(self.enc_card)
 
-        # 3: Source Metadata
+        # Pillar 3: Source Metadata
         self.meta_card = GlassCard("Source Info")
         self.meta_card.setFixedWidth(320)
         
@@ -177,7 +207,7 @@ class BetterVSRWindow(QMainWindow):
         action_layout.addWidget(self.btn_stop)
         self.ui_layout.addLayout(action_layout)
 
-        # Solid Logs
+        # Logs
         self.log = QTextEdit()
         self.log.setReadOnly(True)
         self.log.setPlaceholderText("Ready for input...")
@@ -199,6 +229,8 @@ class BetterVSRWindow(QMainWindow):
 
     def log_msg(self, text):
         self.log.append(f"<b>[SYS]</b> {text}")
+
+    # --- VIDEO & ANALYSIS LOGIC ---
 
     def handle_open_file(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open Video", "", "Video Files (*.mp4 *.mkv *.avi *.ts)")
@@ -223,8 +255,7 @@ class BetterVSRWindow(QMainWindow):
         self.v_start.setValue(85); self.v_end.setValue(100)
         self.h_start.setValue(10); self.h_end.setValue(90)
 
-        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        ffprobe_path = os.path.join(base_dir, "assets", "ffmpeg", "bin", "ffprobe.exe")
+        ffprobe_path = get_resource_path("assets/ffmpeg/bin/ffprobe.exe")
         meta = FFmpegEngine.get_metadata(ffprobe_path, path)
         
         if meta:
@@ -267,22 +298,32 @@ class BetterVSRWindow(QMainWindow):
 
     def start_processing(self):
         if not self.video_path or self.current_frame is None: return
-        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        ffmpeg_exe = get_resource_path("assets/ffmpeg/bin/ffmpeg.exe")
+        model_onnx = get_resource_path("assets/model.onnx")
+        
+        if not os.path.exists(ffmpeg_exe):
+            self.log_msg(f"ERROR: ffmpeg.exe not found")
+            return
+
+        out_path = os.path.splitext(self.video_path)[0] + "_BetterVSR.mp4"
         h, w = self.current_frame.shape[:2]
+        
         settings = {
             'in_path': self.video_path,
-            'out_path': os.path.splitext(self.video_path)[0] + "_BetterVSR.mp4",
-            'ffmpeg_path': os.path.join(base_dir, "assets", "ffmpeg", "bin", "ffmpeg.exe"),
-            'model_path': os.path.join(base_dir, "assets", "model.onnx"),
+            'out_path': out_path,
+            'ffmpeg_path': ffmpeg_exe,
+            'model_path': model_onnx,
             'accel': self.combo_accel.currentText(),
-            'v_codec': "AVC" if "H.264" in self.combo_codec.currentText() else "HEVC",
+            'v_codec': self.combo_codec.currentText(),
             'a_codec': self.combo_audio.currentText(),
             'roi': (int(self.h_start.value()*w/100), int(self.v_start.value()*h/100),
                     int(self.h_end.value()*w/100), int(self.v_end.value()*h/100))
         }
+
         self.btn_run.setEnabled(False); self.btn_open.setEnabled(False)
         self.btn_pause.setEnabled(True); self.btn_stop.setEnabled(True)
         self.progress.setValue(0)
+        
         self.worker_thread = ProcessingWorker(settings)
         self.worker_thread.progress.connect(self.update_progress_ui)
         self.worker_thread.log.connect(self.log_msg)
@@ -303,15 +344,28 @@ class BetterVSRWindow(QMainWindow):
         self.btn_run.setEnabled(True); self.btn_open.setEnabled(True)
         self.btn_pause.setEnabled(False); self.btn_stop.setEnabled(False)
         self.btn_pause.setText("⏸ PAUSE")
-        self.log_msg("Task complete.")
+        self.log_msg("Processing sequence ended.")
 
-    def dragEnterEvent(self, e): 
-        if e.mimeData().hasUrls(): e.acceptProposedAction()
-    def dropEvent(self, e):
+    # --- DRAG AND DROP HANDLERS ---
+    def dragEnterEvent(self, e: QDragEnterEvent): 
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+            self.preview.setStyleSheet("background: rgba(0, 120, 215, 0.1); border: 2px solid #0078d7; border-radius: 12px;")
+
+    def dragLeaveEvent(self, e):
+        self.preview.setStyleSheet("background: rgb(20, 20, 22); border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 12px;")
+
+    def dropEvent(self, e: QDropEvent):
         files = [u.toLocalFile() for u in e.mimeData().urls()]
-        if files: self.load_video(files[0])
+        if files:
+            self.load_video(files[0])
+            self.preview.setStyleSheet("background: rgb(20, 20, 22); border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 12px;")
+
+    # --- WINDOW MOVEMENT ---
     def mousePressEvent(self, e): 
-        if e.button() == Qt.MouseButton.LeftButton: self.drag_pos = e.globalPosition().toPoint()
+        if e.button() == Qt.MouseButton.LeftButton:
+            self.drag_pos = e.globalPosition().toPoint()
+
     def mouseMoveEvent(self, e):
         if hasattr(self, 'drag_pos'):
             self.move(self.pos() + e.globalPosition().toPoint() - self.drag_pos)

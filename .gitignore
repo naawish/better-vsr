@@ -14,3 +14,10 @@ assets/ffmpeg/
 *.build/
 *.dist/
 *.exe
+
+# Nuitka / Build outputs
+*.build/
+*.onefile-build/
+*.dist/
+BetterVSR_Pro.exe
+ffmpeg_debug.log
