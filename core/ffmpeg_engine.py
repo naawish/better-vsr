@@ -99,7 +99,7 @@ class FFmpegEngine:
         
         # macOS ARM/Apple Silicon Hardware Logic (VideoToolbox)
         elif sys.platform == "darwin":
-            if "Hardware" in accel or "NVIDIA" in accel or "AMD" in accel:
+            if "Apple" in accel or "Hardware" in accel or "NVIDIA" in accel or "AMD" in accel:
                 return "hevc_videotoolbox" if is_hevc else "h264_videotoolbox"
         
         # CPU Fallback (Universal)

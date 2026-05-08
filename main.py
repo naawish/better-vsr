@@ -37,10 +37,15 @@ def main():
     # Force the 'Fusion' style as a base for our custom CSS glassmorphism
     app.setStyle("Fusion")
 
-    # 3. Set a professional global font
-    font = QFont("Segoe UI Variable Display", 10)
-    if not font.exactMatch():
-        font = QFont("Segoe UI", 10)
+    # 3. Set a professional global font (platform-appropriate)
+    if sys.platform == "darwin":
+        font = QFont(".AppleSystemUIFont", 13)
+        if not font.exactMatch():
+            font = QFont("Helvetica Neue", 13)
+    else:
+        font = QFont("Segoe UI Variable Display", 10)
+        if not font.exactMatch():
+            font = QFont("Segoe UI", 10)
     app.setFont(font)
 
     # 4. Initialize and show the Main Window
