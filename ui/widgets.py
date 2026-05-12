@@ -8,8 +8,8 @@ class GlassCard(QFrame):
     """A reusable container with a 3D glassmorphism effect."""
     def __init__(self, title=None, parent=None):
         super().__init__(parent)
-        self.layout = QVBoxLayout(self)
-        self.layout.setContentsMargins(15, 20, 15, 15)
+        self._card_layout = QVBoxLayout(self)
+        self._card_layout.setContentsMargins(15, 20, 15, 15)
         
         # Apply the Card Styling
         self.setStyleSheet("""
@@ -30,10 +30,10 @@ class GlassCard(QFrame):
                 background: transparent;
                 border: none;
             """)
-            self.layout.addWidget(self.title_label)
+            self._card_layout.addWidget(self.title_label)
 
     def addWidget(self, widget):
-        self.layout.addWidget(widget)
+        self._card_layout.addWidget(widget)
 
 class ModernSlider(QSlider):
     """A sleek circular slider that fits the iOS/Windows 7 aesthetic."""

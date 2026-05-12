@@ -69,6 +69,21 @@ QMainWindow { background: transparent; }
 /* Panels */
 #LeftPanel    { background: transparent; }
 #PanelDivider { background: rgba(255,255,255,0.06); }
+
+QSplitter#MainSplitter::handle {
+    background: rgba(255,255,255,0.06);
+    width: 4px;
+}
+QSplitter#MainSplitter::handle:hover {
+    background: rgba(0,120,215,0.55);
+}
+
+#LogAction {
+    background: transparent; border: 1px solid rgba(255,255,255,0.10);
+    border-radius: 4px; color: rgba(255,255,255,0.35);
+    font-size: 11px; padding: 0;
+}
+#LogAction:hover { color: #fff; border-color: rgba(255,255,255,0.3); }
 #RightPanel {
     background: rgb(22,22,25);
     border-left: 1px solid rgba(255,255,255,0.06);
@@ -178,6 +193,46 @@ QTextEdit {
 }
 #DestButton:hover { background: """ + _ACCENT_DEEP + """; border-color: """ + _ACCENT + """; }
 
+/* Stats bar */
+#StatsBar {
+    color: rgba(255,255,255,0.4);
+    font-size: 9px;
+    font-family: 'Menlo','Consolas',monospace;
+    background: transparent;
+}
+
+/* ROI preset buttons */
+#PresetButton {
+    background: rgba(255,255,255,0.05);
+    border: 1px solid rgba(255,255,255,0.10);
+    border-radius: 5px;
+    color: rgba(255,255,255,0.55);
+    font-size: 9px; font-weight: 600;
+    padding: 2px 4px;
+}
+#PresetButton:hover { background: rgba(0,120,215,0.35); color: #fff; border-color: #0078d7; }
+
+/* Batch queue panel */
+#BatchHeader {
+    background: rgb(26,26,30);
+    border-top: 1px solid rgba(255,255,255,0.06);
+}
+#BatchToggle { color: rgba(255,255,255,0.4); font-size: 10px; background: transparent; }
+#BatchTitle  { color: rgba(255,255,255,0.55); font-size: 10px; font-weight: 700;
+               letter-spacing: 1px; background: transparent; }
+#BatchHint   { color: rgba(255,255,255,0.2); font-size: 10px; background: transparent; }
+#BatchClear  { background: transparent; border: 1px solid rgba(255,255,255,0.12);
+               border-radius: 4px; color: rgba(255,255,255,0.4); font-size: 9px;
+               padding: 1px 8px; }
+#BatchClear:hover { color: #fff; border-color: rgba(255,255,255,0.3); }
+#QueueIcon   { background: transparent; }
+#QueueName   { color: rgba(255,255,255,0.75); font-size: 10px; background: transparent; }
+#QueueDur    { color: rgba(255,255,255,0.35); font-size: 9px;
+               font-family: 'Menlo','Consolas',monospace; background: transparent; }
+#QueueRemove { background: transparent; border: none; color: rgba(255,255,255,0.25);
+               font-size: 10px; border-radius: 4px; }
+#QueueRemove:hover { background: rgba(220,40,40,0.6); color: #fff; }
+
 /* Scrollbars */
 QScrollBar::handle:vertical   { background: rgba(255,255,255,0.15); }
 QScrollBar::handle:horizontal { background: rgba(255,255,255,0.15); }
@@ -232,6 +287,21 @@ QMainWindow { background: transparent; }
 /* Panels */
 #LeftPanel    { background: transparent; }
 #PanelDivider { background: rgba(0,0,0,0.08); }
+
+QSplitter#MainSplitter::handle {
+    background: rgba(0,0,0,0.08);
+    width: 4px;
+}
+QSplitter#MainSplitter::handle:hover {
+    background: rgba(0,113,227,0.45);
+}
+
+#LogAction {
+    background: transparent; border: 1px solid rgba(0,0,0,0.12);
+    border-radius: 4px; color: rgba(0,0,0,0.35);
+    font-size: 11px; padding: 0;
+}
+#LogAction:hover { color: #000; border-color: rgba(0,0,0,0.3); }
 #RightPanel {
     background: rgb(251,251,254);
     border-left: 1px solid rgba(0,0,0,0.07);
@@ -341,12 +411,48 @@ QTextEdit {
 }
 #DestButton:hover { background: """ + _ACCENT + """; border-color: """ + _ACCENT + """; color: #fff; }
 
+/* Stats bar */
+#StatsBar {
+    color: rgba(0,0,0,0.4);
+    font-size: 9px;
+    font-family: 'Menlo','Consolas',monospace;
+    background: transparent;
+}
+
+/* ROI preset buttons */
+#PresetButton {
+    background: rgba(0,0,0,0.04);
+    border: 1px solid rgba(0,0,0,0.12);
+    border-radius: 5px;
+    color: rgba(0,0,0,0.55);
+    font-size: 9px; font-weight: 600;
+    padding: 2px 4px;
+}
+#PresetButton:hover { background: rgba(0,113,227,0.15); color: #0071e3; border-color: #0071e3; }
+
+/* Batch queue panel */
+#BatchHeader {
+    background: rgb(245,245,250);
+    border-top: 1px solid rgba(0,0,0,0.07);
+}
+#BatchToggle { color: rgba(0,0,0,0.4); font-size: 10px; background: transparent; }
+#BatchTitle  { color: rgba(0,0,0,0.55); font-size: 10px; font-weight: 700;
+               letter-spacing: 1px; background: transparent; }
+#BatchHint   { color: rgba(0,0,0,0.3); font-size: 10px; background: transparent; }
+#BatchClear  { background: transparent; border: 1px solid rgba(0,0,0,0.15);
+               border-radius: 4px; color: rgba(0,0,0,0.45); font-size: 9px;
+               padding: 1px 8px; }
+#BatchClear:hover { color: #000; border-color: rgba(0,0,0,0.3); }
+#QueueIcon   { background: transparent; }
+#QueueName   { color: rgba(0,0,0,0.75); font-size: 10px; background: transparent; }
+#QueueDur    { color: rgba(0,0,0,0.40); font-size: 9px;
+               font-family: 'Menlo','Consolas',monospace; background: transparent; }
+#QueueRemove { background: transparent; border: none; color: rgba(0,0,0,0.25);
+               font-size: 10px; border-radius: 4px; }
+#QueueRemove:hover { background: rgba(220,40,40,0.6); color: #fff; }
+
 /* Scrollbars */
 QScrollBar::handle:vertical   { background: rgba(0,0,0,0.18); }
 QScrollBar::handle:horizontal { background: rgba(0,0,0,0.18); }
 QScrollBar::handle:vertical:hover { background: rgba(0,0,0,0.30); }
 """ + _SCROLLBAR
-
-
-# Legacy alias so any code still importing STYLESHEET doesn't break
-STYLESHEET = DARK_STYLESHEET

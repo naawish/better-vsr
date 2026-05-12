@@ -205,23 +205,27 @@ class ProPainterEngine:
 
     Parameters
     ----------
-    window_size   : frames per temporal batch (default 10)
-    overlap       : overlap between consecutive windows (default 3)
-    quality_limit : pixel value range for output clipping
-    log_fn        : callable(str) for status messages
+    window_size  : temporal window size in frames (default 15; paper default 10)
+    overlap      : overlap between consecutive windows (default 5)
+    mask_dilates : pixels to expand mask before flow masking (default 6; docs: 4–8)
+    log_fn       : callable(str) for status messages
     """
 
     def __init__(
         self,
-        window_size: int = 10,
-        overlap: int = 3,
+        window_size: int = 15,   # paper default=10; 15 gives more temporal context
+        overlap: int = 5,        # scaled up proportionally
+        mask_dilates: int = 6,   # px to expand mask before flow masking (docs: 4→6)
         log_fn=print,
     ):
-        self.window_size = window_size
-        self.overlap     = overlap
-        self._log        = log_fn
-        self._device     = self._pick_device()
-        self._loaded     = False
+        self.window_size  = window_size
+        self.overlap      = overlap
+        self.mask_dilates = mask_dilates
+        self._log         = log_fn
+        self._device      = self._pick_device()
+        # fp16 halves VRAM on MPS/CUDA; needed for 1080p on M-series
+        self._use_fp16    = self._device.type in ("mps", "cuda")
+        self._loaded      = False
 
     # ── device selection ─────────────────────────────────────
 
@@ -274,26 +278,39 @@ class ProPainterEngine:
                                 "recurrent_flow_completion.pth")
         self._inpaint   = _load(InpaintGenerator, "ProPainter.pth",
                                 init_weights=False)
+
+        # Convert flow_net and inpaint to fp16 on GPU/MPS to halve VRAM usage.
+        # RAFT stays in fp32 — its internal normalisations are precision-sensitive.
+        if self._use_fp16:
+            try:
+                self._flow_net = self._flow_net.half()
+                self._inpaint  = self._inpaint.half()
+                self._log("ProPainter: fp16 enabled for flow_net + inpaint.")
+            except Exception as e:
+                self._use_fp16 = False
+                self._log(f"ProPainter: fp16 conversion failed ({e}), using fp32.")
+
         self._loaded    = True
         self._log(f"ProPainter ready on {self._device}.")
 
     # ── frame ↔ tensor helpers ────────────────────────────────
 
     def _to_tensor(self, frames: list) -> torch.Tensor:
-        """List of BGR ndarrays → (T, C, H, W) float32 tensor in [−1, 1]."""
+        """List of BGR ndarrays → (T, C, H, W) float tensor in [−1, 1]."""
         imgs = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB).astype(np.float32) / 127.5 - 1.0
                 for f in frames]
-        t = torch.from_numpy(np.stack(imgs, 0)).permute(0, 3, 1, 2)
-        return t.to(self._device)
+        t = torch.from_numpy(np.stack(imgs, 0)).permute(0, 3, 1, 2).to(self._device)
+        return t.half() if self._use_fp16 else t
 
     def _masks_to_tensor(self, masks: list) -> torch.Tensor:
-        """List of uint8 masks (H, W) → (T, 1, H, W) float32 tensor."""
+        """List of uint8 masks (H, W) → (T, 1, H, W) float tensor."""
         ms = [m.astype(np.float32)[None] / 255.0 for m in masks]
-        return torch.from_numpy(np.stack(ms, 0)).unsqueeze(1).to(self._device)
+        t  = torch.from_numpy(np.stack(ms, 0)).unsqueeze(1).to(self._device)
+        return t.half() if self._use_fp16 else t
 
     def _to_bgr(self, t: torch.Tensor) -> np.ndarray:
-        """(C, H, W) float32 tensor in [−1, 1] → BGR uint8 ndarray."""
-        arr = t.detach().cpu().numpy()
+        """(C, H, W) float tensor in [−1, 1] → BGR uint8 ndarray."""
+        arr = t.float().detach().cpu().numpy()   # cast to fp32 before numpy
         arr = ((arr + 1.0) * 127.5).clip(0, 255).astype(np.uint8)
         arr = np.transpose(arr, (1, 2, 0))
         return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
@@ -327,64 +344,206 @@ class ProPainterEngine:
             frames_t = frames_t * (1 - masks_t) + hint_t * masks_t
 
         # 1. Compute bi-directional optical flow with RAFT
-        flows_f, flows_b = self._raft(frames_t, iters=20)
+        # 32 iters (up from paper default 20) improves flow accuracy in
+        # high-motion scenes; RAFT stays fp32 — precision-sensitive internals.
+        flows_f, flows_b = self._raft(frames_t.float(), iters=32)
 
         # 2. Complete the corrupted flow in masked regions
+        # Cast flow/masks to match flow_net dtype (fp16 or fp32)
+        target_dtype = next(self._flow_net.parameters()).dtype
         pred_flows_f, pred_flows_b = self._flow_net(
-            flows_f, flows_b,
-            masks_t[:, 0],          # (T, H, W)
+            flows_f.to(target_dtype),
+            flows_b.to(target_dtype),
+            masks_t[:, 0].to(target_dtype),   # (T, H, W)
         )
 
         # 3. Inpaint using completed flows + transformer
+        inp_dtype = next(self._inpaint.parameters()).dtype
         pred = self._inpaint(
-            frames_t,
-            masks_t,
-            pred_flows_f,
-            pred_flows_b,
+            frames_t.to(inp_dtype),
+            masks_t.to(inp_dtype),
+            pred_flows_f.to(inp_dtype),
+            pred_flows_b.to(inp_dtype),
         )                            # (T, 3, H, W)
 
         # Composite: keep original pixels outside mask
-        out_t = pred * masks_t + frames_t * (1 - masks_t)
+        out_t = pred * masks_t.to(inp_dtype) + frames_t.to(inp_dtype) * (1 - masks_t.to(inp_dtype))
         return [self._to_bgr(out_t[i]) for i in range(T)]
 
-    def process_batch(
+    # ── memory helpers ────────────────────────────────────────
+
+    def _clear_cache(self) -> None:
+        """Release accumulated MPS / CUDA memory between inference windows."""
+        try:
+            if self._device.type == "mps":
+                torch.mps.empty_cache()
+            elif self._device.type == "cuda":
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+    # ── window loop ───────────────────────────────────────────
+
+    def _run_windows(
         self,
-        frames: list,
-        masks:  list,
-        flow_hints: list | None = None,
+        frames:     list,
+        masks:      list,
+        flow_hints: list | None,
     ) -> list:
         """
-        Process an arbitrary-length sequence of frames with overlapping windows.
+        Overlapping-window ProPainter loop.
 
-        frames     : list of BGR uint8 ndarrays
-        masks      : list of uint8 masks (H×W), 255 = subtitle pixel to remove
-        flow_hints : optional list of flow-warped frames (same length as frames)
-
-        Returns list of inpainted BGR uint8 ndarrays.
+        Returns a list the same length as *frames*.  Slots where every attempt
+        failed are left as ``None`` — the caller is responsible for running a
+        LaMa fallback on those indices.
         """
-        self.load()
-
-        N   = len(frames)
-        out = [None] * N
-        ws  = self.window_size
-        ov  = self.overlap
+        N    = len(frames)
+        out  = [None] * N
+        ws   = self.window_size
+        ov   = self.overlap
         step = max(1, ws - ov)
 
         for start in range(0, N, step):
-            end   = min(start + ws, N)
+            end = min(start + ws, N)
+
+            # Need at least 2 frames for RAFT temporal processing
+            if end - start < 2:
+                continue
+
             w_frames = frames[start:end]
             w_masks  = masks[start:end]
             w_hints  = flow_hints[start:end] if flow_hints else None
 
             try:
                 result = self._process_window(w_frames, w_masks, w_hints)
+                for i, frame in enumerate(result):
+                    out[start + i] = frame
             except Exception as e:
-                self._log(f"ProPainter window [{start}:{end}] error: {e}. "
-                          "Using flow-warp fallback for this window.")
-                result = flow_hints[start:end] if flow_hints else w_frames
-
-            # Write results (later windows overwrite earlier for overlap region)
-            for i, frame in enumerate(result):
-                out[start + i] = frame
+                self._log(f"ProPainter window [{start}:{end}] failed: {e}")
+                # Leave slots as None → LaMa fallback in caller
+            finally:
+                # Always clear MPS/CUDA cache to prevent accumulation
+                self._clear_cache()
 
         return out
+
+    # ── ROI-strip extraction ──────────────────────────────────
+
+    # RAFT's correlation volume at 1/8 scale = (H/8 × W/8)² × 4 bytes.
+    # At 1080p that is 4.17 GB — bigger than one MPS allocation.
+    # Solution: extract only the subtitle strip and scale it down so the
+    # 1/8-scale feature map stays small enough to fit.
+    _PP_STRIP_MAX_H = 240   # max strip height fed to ProPainter (px)
+    _PP_STRIP_MAX_W = 640   # max strip width  fed to ProPainter (px)
+    _PP_STRIP_MARGIN = 80   # vertical context above/below the ROI band
+
+    def _process_strip(
+        self,
+        frames:     list,
+        masks:      list,
+        flow_hints: list | None,
+        roi:        tuple,
+    ) -> list:
+        """
+        Extract a narrow horizontal strip around the subtitle ROI, scale it
+        to fit within _PP_STRIP_MAX_H × _PP_STRIP_MAX_W, run ProPainter on
+        the small crop, then paste the result back into the original frames.
+
+        Returned list has the same length as *frames*.  A ``None`` slot means
+        ProPainter failed for that window — caller should run LaMa.
+        """
+        x1, y1, x2, y2 = roi
+        H, W = frames[0].shape[:2]
+        margin = self._PP_STRIP_MARGIN
+
+        sy1 = max(0, y1 - margin)
+        sy2 = min(H, y2 + margin)
+        sh, sw = sy2 - sy1, W   # strip is always full-width
+
+        # Scale so the strip fits within the budget
+        scale = min(self._PP_STRIP_MAX_W / sw,
+                    self._PP_STRIP_MAX_H / sh,
+                    1.0)
+        tw = max(8, int(sw * scale) // 8 * 8)
+        th = max(8, int(sh * scale) // 8 * 8)
+
+        raft_h = th // 8
+        self._log(
+            f"ProPainter strip: {sw}×{sh} → {tw}×{th} "
+            f"(scale {scale:.2f}x, RAFT features {tw//8}×{raft_h})"
+        )
+
+        # RAFT's multi-scale pyramid needs at least 16 feature rows to avoid
+        # degenerate correlations at the coarser scales (L4 would be 1 row at
+        # raft_h=9).  When the strip is too short, return None for every frame
+        # so the caller falls back to per-frame LaMa.
+        if raft_h < 16:
+            self._log(
+                f"Strip too thin for RAFT ({raft_h} feature rows < 16 minimum) "
+                "— falling back to LaMa for this block."
+            )
+            return [None] * len(frames)
+
+        # Extract + scale crops
+        strips      = [cv2.resize(f[sy1:sy2], (tw, th), interpolation=cv2.INTER_AREA)
+                       for f in frames]
+        strip_masks = [cv2.resize(m[sy1:sy2], (tw, th), interpolation=cv2.INTER_NEAREST)
+                       for m in masks]
+        hint_strips = ([cv2.resize(h[sy1:sy2], (tw, th), interpolation=cv2.INTER_AREA)
+                        for h in flow_hints]
+                       if flow_hints else None)
+
+        strip_results = self._run_windows(strips, strip_masks, hint_strips)
+
+        # Paste results back into full-res frames
+        out = []
+        for i, (f, res) in enumerate(zip(frames, strip_results)):
+            if res is None:
+                out.append(None)
+            else:
+                up    = cv2.resize(res, (sw, sh), interpolation=cv2.INTER_CUBIC)
+                out_f = f.copy()
+                out_f[sy1:sy2] = up
+                out.append(out_f)
+        return out
+
+    # ── public API ────────────────────────────────────────────
+
+    def process_batch(
+        self,
+        frames:     list,
+        masks:      list,
+        flow_hints: list | None = None,
+        roi:        tuple | None = None,
+    ) -> list:
+        """
+        Process an arbitrary-length sequence of frames with overlapping windows.
+
+        frames     : list of BGR uint8 ndarrays (all same resolution)
+        masks      : list of uint8 (H×W) masks, 255 = pixel to inpaint
+        flow_hints : optional pre-warped frames used as ProPainter warm start
+        roi        : (x1, y1, x2, y2) subtitle region.  When given, only the
+                     subtitle strip is sent through ProPainter (≈30× less VRAM
+                     than full-frame 1080p — avoids the RAFT 4 GB OOM).
+
+        Returns a list the same length as *frames*.  Slots where ProPainter
+        failed are ``None`` — caller must substitute LaMa output.
+        """
+        self.load()
+
+        if not frames:
+            return []
+
+        # Dilate masks: ProPainter docs recommend 4–8 px expansion so flow
+        # completion doesn't treat boundary pixels as clean content.
+        if self.mask_dilates > 0:
+            dil_k = cv2.getStructuringElement(
+                cv2.MORPH_RECT,
+                (self.mask_dilates * 2 + 1, self.mask_dilates * 2 + 1),
+            )
+            masks = [cv2.dilate(m, dil_k) for m in masks]
+
+        if roi is not None:
+            return self._process_strip(frames, masks, flow_hints, roi)
+
+        return self._run_windows(frames, masks, flow_hints)

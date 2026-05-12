@@ -1,5 +1,6 @@
 # core/processor.py
 import cv2
+import gc
 import numpy as np
 import onnxruntime as ort
 import os
@@ -20,12 +21,15 @@ class AIProcessor:
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"AI Model not found at: {model_path}")
 
-        self.init_messages = []
+        self._model_path = model_path   # stored so reset_session() can recreate
 
         opts = ort.SessionOptions()
         opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        opts.enable_mem_pattern    = True
-        opts.enable_cpu_mem_arena  = True
+        # Arena enabled (faster per call than disabled).  To prevent the arena
+        # from growing to GBs over hundreds of calls, worker.py calls
+        # reset_session() every 25 LaMa runs to flush the C++ heap.
+        opts.enable_mem_pattern   = True
+        opts.enable_cpu_mem_arena = True
 
         if sys.platform == "darwin":
             import multiprocessing
@@ -33,17 +37,33 @@ class AIProcessor:
         else:
             opts.intra_op_num_threads = 4
 
+        self._opts = opts
+        self._load_session()
+
+    def _load_session(self) -> None:
         try:
             self.session = ort.InferenceSession(
-                model_path, sess_options=opts, providers=["CPUExecutionProvider"]
+                self._model_path, sess_options=self._opts,
+                providers=["CPUExecutionProvider"]
             )
         except Exception as e:
-            print(f"CRITICAL: Failed to load AI model. Error: {e}")
-            raise
-
+            raise RuntimeError(f"Failed to load AI model at {self._model_path}: {e}") from e
         self.active_provider = self.session.get_providers()[0]
         self.input_name  = self.session.get_inputs()[0].name
         self.mask_name   = self.session.get_inputs()[1].name
+
+    def reset_session(self) -> None:
+        """
+        Delete and recreate the ONNX session to flush the C++ memory arena.
+
+        The arena grows by ~2 MB per tile call (4 tiles × 25 frames = 100 calls
+        ≈ 200 MB).  Unchecked, by frame 438 it pushes the process into swap and
+        every LaMa call takes 90+ seconds.  Recreating the session takes ~2-3 s
+        and completely resets the arena, keeping memory flat for the whole run.
+        """
+        del self.session
+        gc.collect()
+        self._load_session()
 
     # ── internal: single-tile LaMa call ──────────────────────────────────────
 
@@ -77,8 +97,13 @@ class AIProcessor:
         img_t = np.transpose(img_t, (2, 0, 1))[None]
         msk_t = (msk_512 > 127).astype(np.float32)[None, None]
 
-        out = self.session.run(None, {self.input_name: img_t, self.mask_name: msk_t})[0][0]
-        out = np.clip(out, 0, 255).astype(np.uint8)
+        raw = self.session.run(None, {self.input_name: img_t, self.mask_name: msk_t})[0][0]
+        # Release large inference inputs immediately so onnxruntime doesn't hold them
+        del img_t, msk_t
+        gc.collect()
+
+        out = np.clip(raw, 0, 255).astype(np.uint8)
+        del raw
         out = np.transpose(out, (1, 2, 0))
         out = out[pt:pt + fit_h, pl:pl + fit_w]             # remove letterbox
         out = cv2.resize(out, (w, h), interpolation=cv2.INTER_CUBIC)
@@ -90,13 +115,18 @@ class AIProcessor:
         self,
         hint_roi:    np.ndarray,   # (ch, cw, 3) BGR — Telea-hinted or original
         context_roi: np.ndarray,   # (ch, cw, 3) BGR — original pixels (for blend)
-        mask:        np.ndarray,   # (ch, cw) uint8
+        mask_inf:    np.ndarray,   # (ch, cw) uint8 — dilated mask fed to LaMa
+        mask_comp:   np.ndarray,   # (ch, cw) uint8 — original mask for compositing
         ch: int, cw: int,
     ) -> np.ndarray:
         """
         Split a wide context strip into overlapping horizontal tiles,
         run LaMa on each, then blend with linear-ramp weights.
-        Returns the blended (ch, cw, 3) BGR result for the full context strip.
+
+        mask_inf  is the dilated mask used for LaMa inference (gives Fourier
+                  convolutions room to blend at mask boundaries).
+        mask_comp is the original undilated mask used for final compositing so
+                  we don't pull in slightly-blurred LaMa edge pixels.
         """
         tile_w  = int(ch * _MAX_AR)          # tile width so AR ≤ _MAX_AR
         overlap = min(64, tile_w // 4)
@@ -111,7 +141,7 @@ class AIProcessor:
             tw    = x_end - x
 
             tile_hint = hint_roi[:, x:x_end]
-            tile_mask = mask[:, x:x_end]
+            tile_mask = mask_inf[:, x:x_end]
 
             if tile_mask.any():
                 tile_out = self._run_lama(tile_hint, tile_mask)
@@ -137,10 +167,11 @@ class AIProcessor:
 
         result = (acc / np.maximum(weights[:, :, None], 1e-9)).astype(np.uint8)
 
-        # Feathered blend: only update masked pixels smoothly
-        mask_f    = cv2.GaussianBlur(mask.astype(np.float32) / 255.0, (11, 11), 0)
-        mask_f    = mask_f[:, :, None]
-        blended   = (result * mask_f + context_roi * (1 - mask_f)).astype(np.uint8)
+        # Feathered blend: composite using ORIGINAL undilated mask so LaMa's
+        # slightly-blurred boundary pixels don't leak outside the subtitle region.
+        mask_f  = cv2.GaussianBlur(mask_comp.astype(np.float32) / 255.0, (11, 11), 0)
+        mask_f  = mask_f[:, :, None]
+        blended = (result * mask_f + context_roi * (1 - mask_f)).astype(np.uint8)
         return blended
 
     # ── public API ────────────────────────────────────────────────────────────
@@ -180,13 +211,21 @@ class AIProcessor:
             cv2.rectangle(mask, (lx1, ly1), (lx2, ly2), 255, -1)
             hint_roi = cv2.inpaint(context_roi, mask, 3, cv2.INPAINT_TELEA)
 
+        # LaMa recommendation: dilate mask 3px vertically before inference so the
+        # Fourier convolutions have room to blend at the mask boundary.  Composite
+        # back with the original undilated mask so boundary pixels don't leak out.
+        _dil_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 7))
+        mask_inf = cv2.dilate(mask, _dil_kernel, iterations=1)
+
         # Route through tiled or single-pass depending on aspect ratio
         if cw > ch * _MAX_AR:
             # Wide strip → tile horizontally so each LaMa call gets ≤ 2.5:1 AR
-            final_roi = self._process_tiled(hint_roi, context_roi, mask, ch, cw)
+            final_roi = self._process_tiled(hint_roi, context_roi,
+                                            mask_inf, mask, ch, cw)
         else:
             # Square-ish → single pass with letterboxing
-            res     = self._run_lama(hint_roi, mask)
+            res     = self._run_lama(hint_roi, mask_inf)
+            # Composite with ORIGINAL undilated mask
             mask_f  = cv2.GaussianBlur(mask.astype(np.float32) / 255.0, (11, 11), 0)
             mask_f  = mask_f[:, :, None]
             final_roi = (res * mask_f + context_roi * (1 - mask_f)).astype(np.uint8)

@@ -54,7 +54,7 @@ def main():
         
         # --- LOAD ICON FROM ASSETS ---
         # Note: Using your specific filename 'BetteVSR Pro icon'
-        icon_filename = "BetteVSR Pro icon.ico" if sys.platform == "win32" else "BetteVSR Pro icon.icns"
+        icon_filename = "BetterVSR Pro icon.ico" if sys.platform == "win32" else "BetterVSR Pro icon.icns"
         icon_path = get_resource_path(os.path.join("assets", "icons", icon_filename))
         
         if os.path.exists(icon_path):

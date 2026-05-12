@@ -4,20 +4,49 @@ __pycache__/
 *$py.class
 venv/
 .env
+*.egg-info/
 
-# BetterVSR Specific
+# OS
+.DS_Store
+Thumbs.db
+
+# BetterVSR runtime artefacts
 ffmpeg_debug.log
 *_BetterVSR.mp4
+*.bvsr
+~/.bettervsr_config.json
+
+# FFmpeg bundled binaries (user provides their own)
 assets/ffmpeg/
 
-# Nuitka / Build
-*.build/
-*.dist/
-*.exe
+# AI model weights — tracked via Git LFS, not committed as plain blobs
+# (model.onnx is already in LFS; propainter weights downloaded at runtime)
+assets/propainter_weights/
+assets/propainter_src/weights/
 
 # Nuitka / Build outputs
 *.build/
 *.onefile-build/
 *.dist/
+dist_mac/
+dist_win/
+_build_mac/
 BetterVSR_Pro.exe
-ffmpeg_debug.log
+BetterVSR\ Pro.exe
+*.app/
+nuitka-crash-report.xml
+
+# Report folder — contains sensitive student info; generated locally
+Report/
+
+# Screenshots — large binary files tracked separately if needed
+Screenshots/
+
+# Claude AI session files
+.claude/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo

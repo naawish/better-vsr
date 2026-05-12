@@ -1,5 +1,6 @@
 # core/worker.py
 import cv2
+import gc
 import numpy as np
 import subprocess
 import sys
@@ -96,6 +97,7 @@ def _build_vision_mask(frame, box, roi, detector):
 class ProcessingWorker(QThread):
     progress = pyqtSignal(float)   # 0-100 across both phases
     log      = pyqtSignal(str)
+    stats    = pyqtSignal(dict)    # live stats during Phase 2 processing
     finished = pyqtSignal()
 
     def __init__(self, settings):
@@ -148,8 +150,6 @@ class ProcessingWorker(QThread):
         # --- LaMa init (always needed as refinement fallback) ---
         self.log.emit("Initializing LaMa engine …")
         ai = AIProcessor(self.s["model_path"])
-        for msg in ai.init_messages:
-            self.log.emit(msg)
         self.log.emit(f"LaMa provider: {ai.active_provider}")
         self.s["_ai"] = ai
 
@@ -160,10 +160,19 @@ class ProcessingWorker(QThread):
 
         # --- ProPainter (loads lazily on first batch) ---
         if engine == "propainter":
-            from core.propainter_engine import ProPainterEngine
-            pp = ProPainterEngine(window_size=10, overlap=3, log_fn=self.log.emit)
-            self.s["_pp"] = pp
-            self.log.emit("ProPainter engine: initialised (weights download on first use).")
+            try:
+                from core.propainter_engine import ProPainterEngine
+                pp = ProPainterEngine(window_size=15, overlap=5, log_fn=self.log.emit)
+                self.s["_pp"] = pp
+                self.log.emit("ProPainter engine: initialised (weights download on first use).")
+            except ImportError as e:
+                # torch not available in slim builds — fall back to LaMa silently
+                self.log.emit(
+                    f"ProPainter unavailable ({e}). "
+                    "Falling back to LaMa — rebuild without --slim for ProPainter support."
+                )
+                self.s["engine"] = "lama"
+                engine = "lama"
 
         # --- Vision OCR ---
         from core.vision_detector import VisionTextDetector, is_available as vision_available
@@ -178,7 +187,7 @@ class ProcessingWorker(QThread):
         # --- Try analysis cache ---
         cached = analyzer.load_cache(video_path, roi)
         if cached is not None:
-            cached = analyzer.expand_detections(cached, padding=10)
+            cached = analyzer.expand_detections(cached, padding=20)
             subtitle_count = sum(1 for f in cached if f["text"])
             self.log.emit(
                 f"Using session cache — {subtitle_count}/{len(cached)} frames "
@@ -199,7 +208,7 @@ class ProcessingWorker(QThread):
             if self.is_running:
                 self.progress.emit(pct * 0.35)
 
-        frame_data, fps, total = analyzer.analyze(
+        frame_data, fps, total, vision_hits, color_hits = analyzer.analyze(
             video_path, roi, detector, progress_cb=_progress
         )
         if not self.is_running:
@@ -209,13 +218,14 @@ class ProcessingWorker(QThread):
         text_frames = sum(1 for f in frame_data if f["text"])
         self.log.emit(
             f"Analysis done in {elapsed:.1f}s — "
-            f"{text_frames}/{total} frames have subtitle text."
+            f"{text_frames}/{total} frames have subtitle text "
+            f"(Vision: {vision_hits}, colour: {color_hits})."
         )
         analyzer.save_cache(video_path, roi, fps, total, frame_data)
         self.log.emit("Analysis cached in memory for this session.")
 
-        # Expand subtitle blocks so Vision-missed frames within a run get inpainted
-        frame_data = analyzer.expand_detections(frame_data, padding=10)
+        # Expand subtitle blocks so frames at the edges of blocks get inpainted
+        frame_data = analyzer.expand_detections(frame_data, padding=20)
         expanded = sum(1 for f in frame_data if f["text"])
         self.log.emit(
             f"Detection expanded: {text_frames} → {expanded} subtitle frames "
@@ -252,9 +262,8 @@ class ProcessingWorker(QThread):
         mode_str = "Flow+LaMa" if use_flow else "LaMa"
         self.log.emit(f"Phase 2 — {mode_str} | codec={v_codec} | skip={frame_skip}")
 
-        count = lama_runs = flow_hits = bg_reused = no_text = 0
+        count = lama_runs = flow_hits = no_text = 0
         cached_roi_patch = None
-        prev_bg_sample   = None
         start_time = last_log = time.time()
 
         while cap.isOpened() and self.is_running:
@@ -281,16 +290,15 @@ class ProcessingWorker(QThread):
                 if flow_eng and not info.get("expanded"):
                     flow_eng.add_clean_frame(frame, count)
                 cached_roi_patch = None
-                prev_bg_sample   = None
 
             elif count % frame_skip != 0 and cached_roi_patch is not None:
+                # frame_skip: reuse last inpainted patch for speed
                 frame[y1:y2, x1:x2] = cached_roi_patch
-
-            elif not _bg_changed(frame, prev_bg_sample, roi):
-                frame[y1:y2, x1:x2] = cached_roi_patch
-                bg_reused += 1
 
             else:
+                # BG similarity reuse removed — it caused stale patches from
+                # a different background frame to overwrite correct content,
+                # making the subtitle area blurry but leaving text visible.
                 # ── Need inpainting ───────────────────────────────────────────
                 # Always use the full ROI rectangle as the mask.
                 # Vision bounding boxes are too tight and miss characters
@@ -301,15 +309,14 @@ class ProcessingWorker(QThread):
                 text_mask = np.full((h_roi, w_roi), 255, dtype=np.uint8)
 
                 # ── Flow warp attempt (Flow+LaMa mode only) ──────────────────
-                if flow_eng and flow_eng._buf_frames:
+                if flow_eng and flow_eng.has_references():
                     # Only attempt warp when we have at least one clean reference
                     warped, quality = flow_eng.warp(frame, count, roi, text_mask)
-                    if quality >= 0.70:
+                    if quality >= 0.85:
                         # Warp is reliable — skip LaMa
                         frame = warped
                         flow_hits += 1
                         cached_roi_patch = frame[y1:y2, x1:x2].copy()
-                        prev_bg_sample   = _bg_sample(frame, roi)
                         count += 1
                         try:
                             self.process.stdin.write(frame.tobytes())
@@ -318,16 +325,23 @@ class ProcessingWorker(QThread):
                             break
                         self.progress.emit(35.0 + count / total_frames * 65.0)
                         continue
-                    elif quality >= 0.40:
+                    elif quality >= 0.55:
                         # Medium quality — use warp as LaMa warm start
                         frame = warped
 
                 # ── LaMa inpainting (always runs if warp skipped or low quality)
                 frame = ai.process_frame(frame, roi)
+                gc.collect()
 
                 cached_roi_patch = frame[y1:y2, x1:x2].copy()
-                prev_bg_sample   = _bg_sample(frame, roi)
                 lama_runs += 1
+
+                # Flush the ONNX arena every 25 LaMa calls to prevent the C++
+                # memory pool growing until it pushes the process into swap.
+                # ~2-3 s per reset vs 90 s/frame in the blowup — well worth it.
+                if lama_runs % 25 == 0:
+                    ai.reset_session()
+                    self.log.emit(f"LaMa arena reset after {lama_runs} calls.")
 
             try:
                 self.process.stdin.write(frame.tobytes())
@@ -343,16 +357,24 @@ class ProcessingWorker(QThread):
                 elapsed  = now - start_time
                 fps_real = count / elapsed
                 eta_s    = (total_frames - count) / fps_real if fps_real > 0 else 0
+                eta_str  = f"{int(eta_s//60)}m {int(eta_s%60)}s"
                 self.log.emit(
-                    f"Frame {count}/{total_frames} | {fps_real:.2f} fps | "
-                    f"ETA {int(eta_s//60)}m {int(eta_s%60)}s"
+                    f"Frame {count}/{total_frames} | {fps_real:.2f} fps | ETA {eta_str}"
                 )
+                self.stats.emit({
+                    "count":   count,
+                    "total":   total_frames,
+                    "fps":     fps_real,
+                    "elapsed": elapsed,
+                    "eta":     eta_str,
+                    "lama":    lama_runs,
+                    "flow":    flow_hits,
+                })
                 last_log = now
 
         cap.release()
         self._finalize(count, total_frames, time.time() - start_time,
-                       extra=f"LaMa: {lama_runs} | Flow hits: {flow_hits} | "
-                             f"BG reused: {bg_reused} | No-text: {no_text}")
+                       extra=f"LaMa: {lama_runs} | Flow hits: {flow_hits} | No-text: {no_text}")
 
     # ── Phase 2b — ProPainter batch mode ─────────────────────
 
@@ -405,7 +427,7 @@ class ProcessingWorker(QThread):
             info = frame_data[idx] if idx < len(frame_data) else {"text": True, "box": None}
             if not info["text"] and not info.get("expanded"):
                 flow_eng.add_clean_frame(frame, idx)
-        self.log.emit(f"Flow buffer: {len(flow_eng._buf_frames)} clean reference frames.")
+        self.log.emit(f"Flow buffer: {len(flow_eng._buf_idx)} clean reference frames.")
 
         # ── Compute per-frame flow-warp hints and decide which need ProPainter ─
         self.log.emit("Computing optical flow hints …")
@@ -428,7 +450,7 @@ class ProcessingWorker(QThread):
             warped, quality = flow_eng.warp(frame, idx, roi, roi_mask)
             masks_list.append(frame_mask.copy())   # FULL frame mask for ProPainter
             hints_list.append(warped)              # full frame with warped ROI
-            needs_pp.append(quality < 0.70)
+            needs_pp.append(quality < 0.85)
 
         # ── ProPainter blocks ────────────────────────────────────────────────
         self.log.emit("Running ProPainter on subtitle blocks …")
@@ -449,62 +471,60 @@ class ProcessingWorker(QThread):
 
         self.log.emit(f"ProPainter blocks: {len(blocks)}")
 
-        processed      = {}
-        pp_unavailable = False   # set True on first failure → skip remaining blocks
+        processed  = {}
+        pp_ran = lama_fallback = 0
 
         for b_idx, (blk_s, blk_e, sub_s, sub_e) in enumerate(blocks):
             if not self.is_running:
                 break
 
             self.log.emit(
-                f"ProPainter block {b_idx+1}/{len(blocks)} (frames {blk_s}–{blk_e}) …"
+                f"ProPainter block {b_idx+1}/{len(blocks)} "
+                f"(frames {blk_s}–{blk_e}, subtitle {sub_s}–{sub_e}) …"
             )
 
-            # FIX 3: on first ProPainter failure, fall back to LaMa for ALL
-            # remaining blocks instead of re-attempting per block.
-            if pp_unavailable:
-                self.log.emit(
-                    f"  ProPainter unavailable — running LaMa on {sub_e - sub_s} frames."
-                )
-                for global_i in range(sub_s, sub_e):
-                    f = all_frames[global_i].copy()
-                    processed[global_i] = self.s["_ai"].process_frame(f, roi)
-                continue
-
+            # process_batch now handles per-window OOM internally and returns
+            # None slots for failed windows.  We always pass roi so it uses
+            # the narrow subtitle strip (≈30× less VRAM than full 1080p frame).
             try:
                 result = pp_eng.process_batch(
                     all_frames[blk_s:blk_e],
                     masks_list[blk_s:blk_e],
                     hints_list[blk_s:blk_e],
+                    roi=roi,
                 )
-                for local_i, global_i in enumerate(range(blk_s, blk_e)):
-                    if sub_s <= global_i < sub_e:
-                        processed[global_i] = result[local_i]
-
             except Exception as e:
-                self.log.emit(
-                    f"  ProPainter failed: {e}\n"
-                    "  Switching to LaMa fallback for all remaining blocks."
-                )
-                pp_unavailable = True
-                # Immediately handle this block with LaMa
-                for global_i in range(sub_s, sub_e):
+                self.log.emit(f"  process_batch raised: {e} — LaMa for whole block.")
+                result = [None] * (blk_e - blk_s)
+
+            for local_i, global_i in enumerate(range(blk_s, blk_e)):
+                if not (sub_s <= global_i < sub_e):
+                    continue
+                if result[local_i] is not None:
+                    processed[global_i] = result[local_i]
+                    pp_ran += 1
+                else:
+                    # ProPainter failed for this frame → LaMa
                     f = all_frames[global_i].copy()
                     processed[global_i] = self.s["_ai"].process_frame(f, roi)
+                    gc.collect()
+                    lama_fallback += 1
+                    if lama_fallback % 25 == 0:
+                        self.s["_ai"].reset_session()
+                        self.log.emit(f"LaMa arena reset after {lama_fallback} fallback calls.")
 
             self.progress.emit(35.0 + (b_idx + 1) / max(len(blocks), 1) * 55.0)
 
         # ── Write output ─────────────────────────────────────────────────────
         self.log.emit("Writing output …")
-        pp_count = warp_count = lama_count = 0
+        warp_count = 0
 
         for idx, frame in enumerate(all_frames):
             if not self.is_running:
                 break
 
             if idx in processed:
-                out_frame  = processed[idx]
-                pp_count  += 1
+                out_frame = processed[idx]
             elif not needs_pp[idx] and (idx < len(frame_data) and frame_data[idx]["text"]):
                 # High-quality flow-warp for subtitle frame — paste warped ROI
                 out_frame = frame.copy()
@@ -521,10 +541,9 @@ class ProcessingWorker(QThread):
 
             self.progress.emit(90.0 + (idx + 1) / total_frames * 10.0)
 
-        label = "ProPainter" if not pp_unavailable else "LaMa-fallback"
         self._finalize(
             len(all_frames), total_frames, time.time() - start_time,
-            extra=f"{label}: {pp_count} | Flow-warp: {warp_count}",
+            extra=f"PP: {pp_ran} | PP→LaMa: {lama_fallback} | Flow-warp: {warp_count}",
         )
 
     # ── shared helpers ────────────────────────────────────────
@@ -542,7 +561,8 @@ class ProcessingWorker(QThread):
 
     def _start_encoder(self):
         s       = self.s
-        v_codec = FFmpegEngine.get_codec(s["accel"], s["v_codec"])
+        # Pass ffmpeg_path so get_codec can verify encoder availability
+        v_codec = FFmpegEngine.get_codec(s["accel"], s["v_codec"], s["ffmpeg_path"])
         cmd     = FFmpegEngine.build_command(
             s["ffmpeg_path"], s["in_path"], s["out_path"],
             s["_safe_w"], s["_safe_h"], s["_fps"], v_codec, s["a_codec"]
@@ -559,11 +579,75 @@ class ProcessingWorker(QThread):
         if self.is_running:
             self.log.emit("Finalizing and saving video …")
             self.process.stdin.close()
-            self.process.wait()
+            try:
+                self.process.wait(timeout=300)
+            except subprocess.TimeoutExpired:
+                self.log.emit("Warning: FFmpeg did not finish in time — force-killing.")
+                self.process.kill()
+                self.process.wait()
             avg = count / elapsed if elapsed > 0 else 0
             msg = f"Done. {count} frames in {t_str} ({avg:.2f} fps avg)"
             if extra:
                 msg += f" | {extra}"
             self.log.emit(msg)
+            self._verify_output()
         else:
             self.log.emit(f"Stopped at frame {count}/{total} after {t_str}.")
+
+    def _verify_output(self):
+        """
+        Scan the output file for remaining subtitle text using colour threshold.
+        Reports how many frames still have detectable text in the ROI region,
+        and which time ranges they fall in — useful for diagnosing missed blocks.
+        """
+        out_path = self.s.get("out_path")
+        roi      = self.s.get("roi")
+        fps      = self.s.get("_fps", 24)
+        if not out_path or not roi:
+            return
+        import os
+        if not os.path.exists(out_path):
+            return
+
+        self.log.emit("Verifying output — scanning for remaining subtitle text …")
+        try:
+            result = analyzer.verify_output(out_path, roi)
+        except Exception as e:
+            self.log.emit(f"Verification failed: {e}")
+            return
+
+        remaining = result["remaining"]
+        total_v   = result["total"]
+        pct       = result["pct"]
+
+        if remaining == 0:
+            self.log.emit("Verification: all subtitle text successfully removed.")
+            return
+
+        self.log.emit(
+            f"Verification: {remaining}/{total_v} frames still have detectable "
+            f"subtitle text ({pct}%)."
+        )
+
+        # Report contiguous runs of remaining-text frames as time ranges
+        frames_list = result["frames"]
+        if not frames_list:
+            return
+        runs = []
+        run_start = frames_list[0]
+        prev      = frames_list[0]
+        for f in frames_list[1:]:
+            if f > prev + 1:
+                runs.append((run_start, prev))
+                run_start = f
+            prev = f
+        runs.append((run_start, prev))
+
+        # Log up to 10 problem ranges
+        shown = runs[:10]
+        for s_f, e_f in shown:
+            ts = lambda n: f"{int(n/fps//60)}:{int(n/fps)%60:02d}"
+            self.log.emit(f"  Remaining text: frames {s_f}–{e_f} "
+                          f"({ts(s_f)}–{ts(e_f)})")
+        if len(runs) > 10:
+            self.log.emit(f"  … and {len(runs)-10} more ranges.")

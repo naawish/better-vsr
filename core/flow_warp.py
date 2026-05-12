@@ -7,9 +7,9 @@ frame we find the nearest clean reference, compute dense optical flow with
 OpenCV's DIS algorithm, and warp the clean pixels into the masked region.
 
 A quality score is returned:
-    ≥ 0.70  →  warp is reliable;  skip ProPainter / LaMa
-    0.40–0.69 →  borderline;       use warped frame as hint for ProPainter
-    < 0.40  →  high motion / big gap;  let ProPainter inpaint from scratch
+    ≥ 0.85  →  warp is reliable;  skip LaMa (threshold raised from 0.70)
+    0.55–0.84 →  borderline;       use warped frame as warm-start hint for LaMa
+    < 0.55  →  high motion / big gap;  LaMa inpaints from scratch
 """
 import cv2
 import numpy as np
@@ -20,8 +20,12 @@ class FlowWarpEngine:
     MAX_BUFFER = 90   # keep up to ~3 s of clean frames at 30 fps
 
     def __init__(self):
-        # DIS MEDIUM is a good balance of speed and quality
         self._dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
+        # MEDIUM gives finest_scale=1 (full-res pyramid level, critical for thin
+        # subtitle bands) and 25 gradient-descent iters.  Override to push quality
+        # further: 40 GD iters + 10 variational-refinement iters smooth seams.
+        self._dis.setGradientDescentIterations(40)
+        self._dis.setVariationalRefinementIterations(10)
         self._buf_frames: deque = deque(maxlen=self.MAX_BUFFER)
         self._buf_idx:    deque = deque(maxlen=self.MAX_BUFFER)
 
@@ -31,6 +35,10 @@ class FlowWarpEngine:
         """Register a frame that has no subtitle in it."""
         self._buf_frames.append(frame.copy())
         self._buf_idx.append(idx)
+
+    def has_references(self) -> bool:
+        """True when at least one clean reference frame is available for warping."""
+        return len(self._buf_frames) > 0
 
     def clear(self) -> None:
         """Reset buffer (call on scene cut or end of subtitle block)."""
