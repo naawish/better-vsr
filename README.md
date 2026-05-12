@@ -113,7 +113,6 @@ GPU-accelerated LaMa inference (MPS/CUDA) is the primary target for v2.1.
 pip install pyinstaller
 python3 build_mac.py            # full build — all 3 engines (~1.3 GB)
 python3 build_mac.py --slim     # slim build — LaMa + Flow+LaMa only (~543 MB)
-# Output: dist_mac/BetterVSR Pro.app
 ```
 
 The slim build excludes `torch`, `timm`, and `einops`. ProPainter falls back to LaMa gracefully when those packages are absent.
@@ -123,7 +122,6 @@ The slim build excludes `torch`, `timm`, and `einops`. ProPainter falls back to 
 ```powershell
 pip install nuitka
 python build_windows.py
-# Output: dist_win\BetterVSR Pro.exe
 ```
 
 ---
@@ -152,16 +150,9 @@ better-vsr/
 │   ├── batch_panel.py           Drag-drop multi-file batch queue
 │   ├── theme.py                 Dark + light QSS stylesheets
 │   └── widgets.py               GlassButton, ModernSlider, GlassCard
-├── assets/
-│   ├── model.onnx               LaMa FP32 ONNX model (198 MB, Git LFS)
-│   └── icons/                   App icons (.icns macOS, .ico Windows)
-└── Report/                      Academic deliverables (gitignored)
-    ├── generate_documents.py    Regenerates all report documents
-    ├── HANDOFF.md               Full development session handoff notes
-    ├── Figures/                 27 figures (matplotlib diagrams + screenshots)
-    ├── BetterVSR_Pro_Report_v3.docx/.pdf
-    ├── BetterVSR_Pro_Comparison_Report.docx/.pdf
-    └── BetterVSR_Pro_Poster_v3.pptx
+└── assets/
+    ├── model.onnx               LaMa FP32 ONNX model (198 MB, Git LFS)
+    └── icons/                   App icons (.icns macOS, .ico Windows)
 ```
 
 ---
@@ -235,14 +226,6 @@ _verify_output(): colour scan → log remaining text % with timestamps
 - **Vision OCR accuracy**: ~22% detection on stylised CJK fonts; colour-threshold fallback extends combined coverage to ~95% but may include false positives in bright scenes.
 - **Two-line subtitles**: Auto-detected ROI covers the bottom line only — expand V-Start to ~77% manually to capture both lines.
 - **ProPainter strip height**: RAFT requires ≥16 feature rows; strips thinner than ~130 px at 1080p fall back to LaMa.
-
----
-
-## References
-
-- Suvorov et al. (2022) *Resolution-robust Large Mask Inpainting with Fourier Convolutions*, WACV 2022.
-- Zhou et al. (2023) *ProPainter: Improving Propagation and Transformer for Video Inpainting*, ICCV 2023.
-- Teed & Deng (2020) *RAFT: Recurrent All-Pairs Field Transforms for Optical Flow*, ECCV 2020.
 
 ---
 
