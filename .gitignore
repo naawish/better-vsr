@@ -20,11 +20,10 @@ ffmpeg_debug.log
 assets/ffmpeg/
 
 # AI model weights — tracked via Git LFS, not committed as plain blobs
-# (model.onnx is already in LFS; propainter weights downloaded at runtime)
 assets/propainter_weights/
 assets/propainter_src/weights/
 
-# Nuitka / Build outputs
+# Build outputs
 *.build/
 *.onefile-build/
 *.dist/
@@ -36,13 +35,9 @@ BetterVSR\ Pro.exe
 *.app/
 nuitka-crash-report.xml
 
-# Report folder — contains sensitive student info; generated locally
+# Local files
 Report/
-
-# Screenshots — large binary files tracked separately if needed
 Screenshots/
-
-# Claude AI session files
 .claude/
 
 # IDE / editor
