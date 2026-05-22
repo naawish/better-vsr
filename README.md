@@ -25,6 +25,14 @@ BetterVSR Pro removes hardcoded (burned-in) subtitles from video files using dee
 
 ---
 
+## Before / After
+
+![Before and After — full frame](Screenshots%20and%20Samples/fig04_before_after.jpg)
+
+![Before and After — close-up](Screenshots%20and%20Samples/fig04b_before_after_closeup.jpg)
+
+---
+
 ## AI Engine Modes
 
 ### LaMa (Default — Recommended)
